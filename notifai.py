@@ -168,13 +168,14 @@ def marcar_corrido(estado_agendamento: dict, job_id: str, horario: str) -> None:
 
 # ---------- integrações externas ----------
 
-def pesquisar_tavily(query: str) -> dict:
+def pesquisar_tavily(query: str, time_range: str = "month") -> dict:
     payload = {
         "api_key": TAVILY_API_KEY,
         "query": query,
         "search_depth": "advanced",
         "include_answer": True,
         "max_results": 5,
+        "time_range": time_range,
     }
     resp = requests.post(TAVILY_URL, json=payload, timeout=30)
     resp.raise_for_status()
@@ -302,7 +303,9 @@ def processar_job(job: dict) -> Optional[dict]:
     log_debug(f"[{job_id}] a chamar Tavily...")
     t0 = time.time()
     try:
-        resultado_tavily = pesquisar_tavily(job["promptTavily"])
+        resultado_tavily = pesquisar_tavily(
+            job["promptTavily"], time_range=job.get("tavily_time_range", "month")
+        )
     except Exception as erro:
         log(f"ERRO [{job_id}] Tavily: {erro}")
         return None
@@ -318,6 +321,7 @@ def processar_job(job: dict) -> Optional[dict]:
     prompt_final = prompt_final.replace(
         "{{RESULTADOS_TAVILY}}", json.dumps(resultados_resumidos, ensure_ascii=False)
     )
+    prompt_final = prompt_final.replace("{{DATA_HOJE}}", date.today().isoformat())
     prompt_final += nota_data_passada(estado_anterior)
 
     log_debug(f"[{job_id}] a chamar Gemma...")
