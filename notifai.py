@@ -14,6 +14,8 @@ execução agendada tenta sempre do zero).
 import fcntl
 import json
 import os
+import time
+from collections import defaultdict
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -58,6 +60,10 @@ def obter_segredo(nome: str) -> str:
 TAVILY_API_KEY = obter_segredo("TAVILY_API_KEY")
 NTFY_TOPIC = obter_segredo("NTFY_TOPIC")
 
+# Logs detalhados por fase (chamadas, durações) — úteis para depurar, mas
+# escrevem mais vezes no cartão SD. Põe LOG_VERBOSE=true no .env se quiseres.
+LOG_VERBOSE = obter_segredo("LOG_VERBOSE").strip().lower() in ("1", "true", "sim", "yes")
+
 # Não-segredos — estes podem continuar no código sem problema
 TAVILY_URL = "https://api.tavily.com/search"
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -85,6 +91,13 @@ def log(mensagem: str) -> None:
     linha = f"[{datetime.now().isoformat(timespec='seconds')}] {mensagem}"
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(linha + "\n")
+
+
+def log_debug(mensagem: str) -> None:
+    """Como log(), mas só escreve se LOG_VERBOSE estiver ligado — para não
+    estar sempre a gravar no cartão SD em uso normal."""
+    if LOG_VERBOSE:
+        log(mensagem)
 
 
 def carregar_json(caminho: Path, default):
@@ -168,6 +181,23 @@ def pesquisar_tavily(query: str) -> dict:
     return resp.json()
 
 
+def resumir_resultados_tavily(resultado_tavily: dict, max_caracteres_por_resultado: int = 500) -> dict:
+    """Reduz a resposta crua da Tavily ao essencial antes de ir para o
+    prompt do Gemma — menos ruído, menos tokens, menos risco de estourar
+    o contexto e cortar o JSON de resposta a meio."""
+    resumo = {"resposta_sintetizada": resultado_tavily.get("answer", "")}
+    resultados_reduzidos = []
+    for r in resultado_tavily.get("results", [])[:5]:
+        resultados_reduzidos.append({
+            "titulo": r.get("title", ""),
+            "url": r.get("url", ""),
+            "data_publicacao": r.get("published_date", ""),
+            "conteudo": (r.get("content", "") or "")[:max_caracteres_por_resultado],
+        })
+    resumo["resultados"] = resultados_reduzidos
+    return resumo
+
+
 # Schema real (não só "é JSON válido") — restringe a geração aos nomes e
 # tipos de campo exatos, em vez de confiar que o modelo escreve "resumo"
 # e não "resuma". Usado por todos os jobs, mesmo os que não usam todos os
@@ -205,7 +235,11 @@ def perguntar_gemma(prompt: str) -> dict:
             "prompt": prompt,
             "stream": False,
             "format": SCHEMA_RESPOSTA_GEMMA,
-            "options": {"temperature": 0.2},
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 8192,     # o defeito do Ollama (2048-4096) corta o JSON a meio em prompts maiores
+                "num_predict": 800,  # suficiente para o schema, evita gerações descontroladas
+            },
         },
         timeout=240,
     )
@@ -265,26 +299,35 @@ def processar_job(job: dict) -> Optional[dict]:
     job_id = job["id"]
     estado_anterior = ESTADO_CONTEUDO_ATUAL.get(job_id, {})
 
+    log_debug(f"[{job_id}] a chamar Tavily...")
+    t0 = time.time()
     try:
         resultado_tavily = pesquisar_tavily(job["promptTavily"])
     except Exception as erro:
         log(f"ERRO [{job_id}] Tavily: {erro}")
         return None
+    log_debug(f"[{job_id}] Tavily respondeu em {time.time() - t0:.1f}s "
+              f"({len(resultado_tavily.get('results', []))} resultados)")
+
+    resultados_resumidos = resumir_resultados_tavily(resultado_tavily)
 
     prompt_final = job["promptZAI"]
     prompt_final = prompt_final.replace(
         "{{ESTADO_ANTERIOR}}", json.dumps(estado_anterior, ensure_ascii=False)
     )
     prompt_final = prompt_final.replace(
-        "{{RESULTADOS_TAVILY}}", json.dumps(resultado_tavily, ensure_ascii=False)
+        "{{RESULTADOS_TAVILY}}", json.dumps(resultados_resumidos, ensure_ascii=False)
     )
     prompt_final += nota_data_passada(estado_anterior)
 
+    log_debug(f"[{job_id}] a chamar Gemma...")
+    t0 = time.time()
     try:
         resposta = perguntar_gemma(prompt_final)
     except Exception as erro:
         log(f"ERRO [{job_id}] Gemma: {erro}")
         return None
+    log_debug(f"[{job_id}] Gemma respondeu em {time.time() - t0:.1f}s")
 
     campos_esperados = {"ha_novidade", "titulo", "novidades", "resumo_completo", "fontes"}
     if not campos_esperados.issubset(resposta.keys()):
@@ -293,12 +336,15 @@ def processar_job(job: dict) -> Optional[dict]:
 
     modo = job.get("modo", "novidade")
     deve_notificar = modo == "diario" or resposta.get("ha_novidade") is True
+    log_debug(f"[{job_id}] modo={modo} ha_novidade={resposta.get('ha_novidade')} "
+              f"-> {'vai notificar' if deve_notificar else 'não notifica'}")
 
     if deve_notificar:
         usar_delta = modo == "novidade" and resposta.get("novidades")
         corpo = resposta["novidades"] if usar_delta else resposta["resumo_completo"]
         try:
             notificar_ntfy(resposta["titulo"], corpo, resposta.get("fontes", []))
+            log_debug(f"[{job_id}] notificação enviada.")
         except Exception as erro:
             log(f"ERRO [{job_id}] ntfy: {erro}")
     else:
@@ -330,9 +376,18 @@ def main() -> None:
 
         pendentes = jobs_em_atraso(config, estado_agendamento)
 
+        # Agrupa por job_id: se dois horários do MESMO job estiverem em
+        # atraso ao mesmo tempo (ex: Pi esteve desligado e ambos os
+        # horários de hoje já passaram), o trabalho (Tavily + Gemma) só é
+        # feito uma vez — o conteúdo seria igual de qualquer forma.
+        por_job = defaultdict(list)
         for job, horario in pendentes:
-            job_id = job["id"]
-            log(f"--- A processar job '{job_id}' (horário {horario}) ---")
+            por_job[job["id"]].append((job, horario))
+
+        for job_id, ocorrencias in por_job.items():
+            job = ocorrencias[0][0]
+            horarios_pendentes = [h for _, h in ocorrencias]
+            log(f"--- A processar job '{job_id}' (horários em atraso: {', '.join(horarios_pendentes)}) ---")
 
             try:
                 novo_estado = processar_job(job)
@@ -341,10 +396,11 @@ def main() -> None:
             except Exception as erro:
                 log(f"ERRO inesperado [{job_id}]: {erro}")
             finally:
-                # marca como tentado hoje mesmo se falhou — evita martelar a
-                # Tavily/Gemma a cada minuto; só volta a tentar no próximo
-                # horário agendado
-                marcar_corrido(estado_agendamento, job_id, horario)
+                # marca TODOS os horários em atraso como tentados hoje —
+                # evita martelar a Tavily/Gemma a cada minuto; só volta a
+                # tentar no próximo horário agendado
+                for horario in horarios_pendentes:
+                    marcar_corrido(estado_agendamento, job_id, horario)
 
         guardar_json(ESTADO_AGENDAMENTO_PATH, estado_agendamento)
         guardar_json(ESTADO_CONTEUDO_PATH, ESTADO_CONTEUDO_ATUAL)
