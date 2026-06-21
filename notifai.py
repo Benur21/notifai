@@ -11,6 +11,7 @@ nunca bloqueiam os outros jobs nem impedem tentativas futuras (a próxima
 execução agendada tenta sempre do zero).
 """
 
+import fcntl
 import json
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -44,6 +45,7 @@ CONFIG_PATH = BASE_DIR / "config.json"
 ESTADO_AGENDAMENTO_PATH = BASE_DIR / "estado_agendamento.json"
 ESTADO_CONTEUDO_PATH = BASE_DIR / "estado_conteudo.json"
 LOG_PATH = BASE_DIR / "notifai.log"
+LOCK_PATH = BASE_DIR / "notifai.lock"
 
 
 # ---------- utilitários básicos ----------
@@ -68,6 +70,31 @@ def carregar_json(caminho: Path, default):
 def guardar_json(caminho: Path, dados) -> None:
     with open(caminho, "w", encoding="utf-8") as f:
         json.dump(dados, f, indent=2, ensure_ascii=False)
+
+
+def adquirir_lock():
+    """Tenta obter um trinco exclusivo. Devolve o ficheiro aberto (a manter
+    vivo durante toda a execução) se conseguir, ou None se já houver outra
+    execução em curso — para evitar execuções sobrepostas quando um job
+    demora mais do que o intervalo do cron."""
+    lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except BlockingIOError:
+        lock_file.close()
+        return None
+
+
+def validar_configuracao() -> bool:
+    problemas = []
+    if not TAVILY_API_KEY or "A_TUA_CHAVE" in TAVILY_API_KEY:
+        problemas.append("TAVILY_API_KEY ainda não foi configurada.")
+    if not NTFY_TOPIC or NTFY_TOPIC == "o-teu-topico-secreto-aqui":
+        problemas.append("NTFY_TOPIC ainda é o valor de exemplo — não configurado.")
+    for p in problemas:
+        log(f"CONFIG INVÁLIDA: {p}")
+    return not problemas
 
 
 # ---------- agendamento ----------
@@ -125,14 +152,21 @@ SCHEMA_RESPOSTA_GEMMA = {
         "data_lancamento": {"type": ["string", "null"]},
         "fontes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["ha_novidade", "titulo", "novidades", "resumo_completo", "fontes"],
+    "required": [
+        "ha_novidade",
+        "titulo",
+        "novidades",
+        "resumo_completo",
+        "estado_lancamento",
+        "data_lancamento",
+        "fontes",
+    ],
 }
 
 
 def perguntar_gemma(prompt: str) -> dict:
     """Chama o Gemma local e devolve o JSON já parseado, com os campos
     restringidos pelo schema (não apenas "é JSON válido")."""
-    #TODO ajustar os parâmetros
     resp = requests.post(
         OLLAMA_URL,
         json={
@@ -140,8 +174,9 @@ def perguntar_gemma(prompt: str) -> dict:
             "prompt": prompt,
             "stream": False,
             "format": SCHEMA_RESPOSTA_GEMMA,
+            "options": {"temperature": 0.2},
         },
-        timeout=180,
+        timeout=240,
     )
     resp.raise_for_status()
     texto = resp.json().get("response", "")
@@ -151,7 +186,6 @@ def perguntar_gemma(prompt: str) -> dict:
 def notificar_ntfy(titulo: str, mensagem: str, fontes: list) -> None:
     if len(mensagem) > LIMITE_CARATERES_NOTIFICACAO:
         mensagem = mensagem[:LIMITE_CARATERES_NOTIFICACAO] + "\n\n(...cortado)"
-        #TODO neste caso reduzir a mensagem por resumo do Gemma em vez de cortar
 
     payload = {
         "topic": NTFY_TOPIC,
@@ -250,30 +284,42 @@ ESTADO_CONTEUDO_ATUAL: dict = {}
 def main() -> None:
     global ESTADO_CONTEUDO_ATUAL
 
-    config = carregar_json(CONFIG_PATH, [])
-    estado_agendamento = carregar_json(ESTADO_AGENDAMENTO_PATH, {})
-    ESTADO_CONTEUDO_ATUAL = carregar_json(ESTADO_CONTEUDO_PATH, {})
+    if not validar_configuracao():
+        return  # já registado em log por validar_configuracao()
 
-    pendentes = jobs_em_atraso(config, estado_agendamento)
+    lock = adquirir_lock()
+    if lock is None:
+        log("Já existe uma execução em curso — a sair sem fazer nada.")
+        return
 
-    for job, horario in pendentes:
-        job_id = job["id"]
-        log(f"--- A processar job '{job_id}' (horário {horario}) ---")
+    try:
+        config = carregar_json(CONFIG_PATH, [])
+        estado_agendamento = carregar_json(ESTADO_AGENDAMENTO_PATH, {})
+        ESTADO_CONTEUDO_ATUAL = carregar_json(ESTADO_CONTEUDO_PATH, {})
 
-        try:
-            novo_estado = processar_job(job)
-            if novo_estado is not None:
-                ESTADO_CONTEUDO_ATUAL[job_id] = novo_estado
-        except Exception as erro:
-            log(f"ERRO inesperado [{job_id}]: {erro}")
-        finally:
-            # marca como tentado hoje mesmo se falhou — evita martelar a
-            # Tavily/Gemma a cada minuto; só volta a tentar no próximo
-            # horário agendado
-            marcar_corrido(estado_agendamento, job_id, horario)
+        pendentes = jobs_em_atraso(config, estado_agendamento)
 
-    guardar_json(ESTADO_AGENDAMENTO_PATH, estado_agendamento)
-    guardar_json(ESTADO_CONTEUDO_PATH, ESTADO_CONTEUDO_ATUAL)
+        for job, horario in pendentes:
+            job_id = job["id"]
+            log(f"--- A processar job '{job_id}' (horário {horario}) ---")
+
+            try:
+                novo_estado = processar_job(job)
+                if novo_estado is not None:
+                    ESTADO_CONTEUDO_ATUAL[job_id] = novo_estado
+            except Exception as erro:
+                log(f"ERRO inesperado [{job_id}]: {erro}")
+            finally:
+                # marca como tentado hoje mesmo se falhou — evita martelar a
+                # Tavily/Gemma a cada minuto; só volta a tentar no próximo
+                # horário agendado
+                marcar_corrido(estado_agendamento, job_id, horario)
+
+        guardar_json(ESTADO_AGENDAMENTO_PATH, estado_agendamento)
+        guardar_json(ESTADO_CONTEUDO_PATH, ESTADO_CONTEUDO_ATUAL)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 if __name__ == "__main__":
