@@ -13,23 +13,55 @@ execução agendada tenta sempre do zero).
 
 import fcntl
 import json
+import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
 import requests
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def carregar_env(caminho: Path) -> dict:
+    """Lê um ficheiro .env simples (uma variável por linha, KEY=VALOR).
+    Linhas vazias ou a começar por # são ignoradas. Não faz parsing
+    sofisticado de propósito — não precisamos de mais do que isto."""
+    valores = {}
+    if not caminho.exists():
+        return valores
+    with open(caminho, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha or linha.startswith("#") or "=" not in linha:
+                continue
+            chave, _, valor = linha.partition("=")
+            valores[chave.strip()] = valor.strip().strip('"').strip("'")
+    return valores
+
+
+# Variáveis de ambiente reais (ex: definidas no systemd) têm sempre
+# prioridade sobre o ficheiro .env, que serve sobretudo para correres
+# localmente sem teres de exportar nada à mão.
+_env = carregar_env(BASE_DIR / ".env")
+
+
+def obter_segredo(nome: str) -> str:
+    return os.environ.get(nome) or _env.get(nome, "")
+
+
 # ============================================================
-# CONFIGURAÇÃO — edita estes valores
+# CONFIGURAÇÃO
 # ============================================================
 
-TAVILY_API_KEY = "tvly-A_TUA_CHAVE_AQUI"
+# Segredos — vêm do .env (ou de variáveis de ambiente reais), nunca daqui
+TAVILY_API_KEY = obter_segredo("TAVILY_API_KEY")
+NTFY_TOPIC = obter_segredo("NTFY_TOPIC")
+
+# Não-segredos — estes podem continuar no código sem problema
 TAVILY_URL = "https://api.tavily.com/search"
-
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODELO_GEMMA = "gemma3:1b"
-
-NTFY_TOPIC = "o-teu-topico-secreto-aqui"
 NTFY_URL = "https://ntfy.sh"
 
 # Dias de tolerância após a data prevista de um evento antes de assumirmos
@@ -40,7 +72,6 @@ LIMITE_CARATERES_NOTIFICACAO = 2800
 
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 ESTADO_AGENDAMENTO_PATH = BASE_DIR / "estado_agendamento.json"
 ESTADO_CONTEUDO_PATH = BASE_DIR / "estado_conteudo.json"
@@ -88,10 +119,10 @@ def adquirir_lock():
 
 def validar_configuracao() -> bool:
     problemas = []
-    if not TAVILY_API_KEY or "A_TUA_CHAVE" in TAVILY_API_KEY:
-        problemas.append("TAVILY_API_KEY ainda não foi configurada.")
-    if not NTFY_TOPIC or NTFY_TOPIC == "o-teu-topico-secreto-aqui":
-        problemas.append("NTFY_TOPIC ainda é o valor de exemplo — não configurado.")
+    if not TAVILY_API_KEY:
+        problemas.append("TAVILY_API_KEY não encontrada (.env ou variável de ambiente).")
+    if not NTFY_TOPIC:
+        problemas.append("NTFY_TOPIC não encontrado (.env ou variável de ambiente).")
     for p in problemas:
         log(f"CONFIG INVÁLIDA: {p}")
     return not problemas
