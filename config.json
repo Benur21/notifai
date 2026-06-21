@@ -1,0 +1,9 @@
+[
+  {
+    "id": "starship-proximo-lancamento",
+    "horarios": ["10:00", "18:00"],
+    "modo": "novidade",
+    "promptTavily": "SpaceX Starship next test flight launch date news",
+    "promptZAI": "Es um assistente que verifica se ha novidades sobre o proximo lancamento de teste da Starship da SpaceX.\n\nEstado anteriormente conhecido (pode estar vazio se for a primeira vez que corres):\n{{ESTADO_ANTERIOR}}\n\nResultados da pesquisa mais recente:\n{{RESULTADOS_TAVILY}}\n\nCompara o estado anterior com os resultados novos. Responde APENAS com um JSON valido, sem texto antes ou depois, exatamente neste formato:\n{\"ha_novidade\": true, \"titulo\": \"titulo curto para a notificacao\", \"novidades\": \"o que mudou desde a ultima vez, string vazia se nao ha novidade\", \"resumo_completo\": \"resumo atualizado e completo do que se sabe agora, para guardar como novo estado\", \"estado_lancamento\": \"agendado\", \"data_lancamento\": \"AAAA-MM-DD ou null se desconhecida\", \"fontes\": [\"url1\", \"url2\"]}\n\nO campo estado_lancamento deve ser um destes valores: agendado, lancado, scrubbed, desconhecido."
+  }
+]

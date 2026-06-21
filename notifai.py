@@ -132,6 +132,7 @@ SCHEMA_RESPOSTA_GEMMA = {
 def perguntar_gemma(prompt: str) -> dict:
     """Chama o Gemma local e devolve o JSON já parseado, com os campos
     restringidos pelo schema (não apenas "é JSON válido")."""
+    #TODO ajustar os parâmetros
     resp = requests.post(
         OLLAMA_URL,
         json={
@@ -150,6 +151,7 @@ def perguntar_gemma(prompt: str) -> dict:
 def notificar_ntfy(titulo: str, mensagem: str, fontes: list) -> None:
     if len(mensagem) > LIMITE_CARATERES_NOTIFICACAO:
         mensagem = mensagem[:LIMITE_CARATERES_NOTIFICACAO] + "\n\n(...cortado)"
+        #TODO neste caso reduzir a mensagem por resumo do Gemma em vez de cortar
 
     payload = {
         "topic": NTFY_TOPIC,
