@@ -313,6 +313,7 @@ def processar_job(job: dict) -> Optional[dict]:
               f"({len(resultado_tavily.get('results', []))} resultados)")
 
     resultados_resumidos = resumir_resultados_tavily(resultado_tavily)
+    log_debug(f"[{job_id}] Tavily resumo:\n{json.dumps(resultados_resumidos, indent=2, ensure_ascii=False)}")
 
     prompt_final = job["promptZAI"]
     prompt_final = prompt_final.replace(
@@ -332,6 +333,7 @@ def processar_job(job: dict) -> Optional[dict]:
         log(f"ERRO [{job_id}] Gemma: {erro}")
         return None
     log_debug(f"[{job_id}] Gemma respondeu em {time.time() - t0:.1f}s")
+    log_debug(f"[{job_id}] Gemma resposta:\n{json.dumps(resposta, indent=2, ensure_ascii=False)}")
 
     campos_esperados = {"ha_novidade", "titulo", "novidades", "resumo_completo", "fontes"}
     if not campos_esperados.issubset(resposta.keys()):
