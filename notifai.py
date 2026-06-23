@@ -212,7 +212,6 @@ SCHEMA_RESPOSTA_GEMMA = {
         "resumo_completo": {"type": "string"},
         "estado_lancamento": {"type": "string"},
         "data_lancamento": {"type": ["string", "null"]},
-        "fontes": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "ha_novidade",
@@ -221,7 +220,6 @@ SCHEMA_RESPOSTA_GEMMA = {
         "resumo_completo",
         "estado_lancamento",
         "data_lancamento",
-        "fontes",
     ],
 }
 
@@ -249,6 +247,28 @@ def perguntar_gemma(prompt: str) -> dict:
     return json.loads(texto)  # propaga JSONDecodeError se o conteúdo não bater certo
 
 
+def e_url_util(url: str) -> bool:
+    """Rejeita URLs que são só o domínio raiz (ex: https://nbcnews.com/)
+    — essas não têm artigo específico e são inúteis como fonte."""
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path.strip("/")
+        return len(path) > 0
+    except Exception:
+        return True  # em caso de dúvida, mantém
+
+
+def url_existe(url: str, timeout: int = 8) -> bool:
+    """Faz um HEAD request para confirmar que o URL responde com 2xx/3xx.
+    URLs que devolvam 4xx (ex: 404 Not Found) são descartados."""
+    try:
+        resp = requests.head(url, timeout=timeout, allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        return resp.status_code < 400
+    except Exception:
+        return False  # timeout, DNS fail, etc. — descarta por segurança
+
+
 def notificar_ntfy(titulo: str, mensagem: str, fontes: list) -> None:
     if len(mensagem) > LIMITE_CARATERES_NOTIFICACAO:
         mensagem = mensagem[:LIMITE_CARATERES_NOTIFICACAO] + "\n\n(...cortado)"
@@ -260,7 +280,7 @@ def notificar_ntfy(titulo: str, mensagem: str, fontes: list) -> None:
         "tags": ["rocket"],
     }
 
-    fontes_validas = [f for f in (fontes or []) if f]
+    fontes_validas = [f for f in (fontes or []) if f and e_url_util(f)]
     if fontes_validas:
         payload["click"] = fontes_validas[0]  # tocar na notificação abre a fonte principal
         payload["actions"] = [
@@ -313,6 +333,13 @@ def processar_job(job: dict) -> Optional[dict]:
               f"({len(resultado_tavily.get('results', []))} resultados)")
 
     resultados_resumidos = resumir_resultados_tavily(resultado_tavily)
+    fontes_tavily = [
+        r["url"] for r in resultados_resumidos.get("resultados", [])
+        if r.get("url") and e_url_util(r["url"])
+    ]
+    log_debug(f"[{job_id}] a validar {len(fontes_tavily)} URLs da Tavily...")
+    fontes_tavily = [url for url in fontes_tavily if url_existe(url)]
+    log_debug(f"[{job_id}] {len(fontes_tavily)} URLs válidos após validação")
     log_debug(f"[{job_id}] Tavily resumo:\n{json.dumps(resultados_resumidos, indent=2, ensure_ascii=False)}")
 
     prompt_final = job["promptZAI"]
@@ -349,7 +376,7 @@ def processar_job(job: dict) -> Optional[dict]:
         usar_delta = modo == "novidade" and resposta.get("novidades")
         corpo = resposta["novidades"] if usar_delta else resposta["resumo_completo"]
         try:
-            notificar_ntfy(resposta["titulo"], corpo, resposta.get("fontes", []))
+            notificar_ntfy(resposta["titulo"], corpo, fontes_tavily)
             log_debug(f"[{job_id}] notificação enviada.")
         except Exception as erro:
             log(f"ERRO [{job_id}] ntfy: {erro}")
