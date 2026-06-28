@@ -185,41 +185,40 @@ def pesquisar_tavily(query: str, time_range: str = "month") -> dict:
 def resumir_resultados_tavily(resultado_tavily: dict, max_caracteres_por_resultado: int = 500) -> dict:
     """Reduz a resposta crua da Tavily ao essencial antes de ir para o
     prompt do Gemma — menos ruído, menos tokens, menos risco de estourar
-    o contexto e cortar o JSON de resposta a meio."""
-    resumo = {"resposta_sintetizada": resultado_tavily.get("answer", "")}
+    o contexto e cortar o JSON de resposta a meio.
+    Nota: não incluímos o campo 'answer' (resumo da Tavily) de propósito —
+    o Gemma tendia a copiá-lo em vez de analisar os resultados individuais."""
     resultados_reduzidos = []
     for r in resultado_tavily.get("results", [])[:5]:
         resultados_reduzidos.append({
-            "titulo": r.get("title", ""),
+            "title": r.get("title", ""),
             "url": r.get("url", ""),
-            "data_publicacao": r.get("published_date", ""),
-            "conteudo": (r.get("content", "") or "")[:max_caracteres_por_resultado],
+            "published_date": r.get("published_date", ""),
+            "content": (r.get("content", "") or "")[:max_caracteres_por_resultado],
         })
-    resumo["resultados"] = resultados_reduzidos
-    return resumo
+    return {"results": resultados_reduzidos}
 
 
 # Schema real (não só "é JSON válido") — restringe a geração aos nomes e
-# tipos de campo exatos, em vez de confiar que o modelo escreve "resumo"
-# e não "resuma". Usado por todos os jobs, mesmo os que não usam todos os
-# campos (ex: estado_lancamento só interessa a jobs de eventos agendados).
+# tipos de campo exatos. Keys em inglês para consistência com o conteúdo
+# da Tavily (também em inglês) e evitar confusão de línguas no modelo.
 SCHEMA_RESPOSTA_GEMMA = {
     "type": "object",
     "properties": {
-        "ha_novidade": {"type": "boolean"},
-        "titulo": {"type": "string"},
-        "novidades": {"type": "string"},
-        "resumo_completo": {"type": "string"},
-        "estado_lancamento": {"type": "string"},
-        "data_lancamento": {"type": ["string", "null"]},
+        "has_news": {"type": "boolean"},
+        "title": {"type": "string"},
+        "delta": {"type": "string"},
+        "summary": {"type": "string"},
+        "launch_status": {"type": "string"},
+        "launch_date": {"type": ["string", "null"]},
     },
     "required": [
-        "ha_novidade",
-        "titulo",
-        "novidades",
-        "resumo_completo",
-        "estado_lancamento",
-        "data_lancamento",
+        "has_news",
+        "title",
+        "delta",
+        "summary",
+        "launch_status",
+        "launch_date",
     ],
 }
 
@@ -237,7 +236,7 @@ def perguntar_gemma(prompt: str) -> dict:
             "options": {
                 "temperature": 0.2,
                 "num_ctx": 8192,     # o defeito do Ollama (2048-4096) corta o JSON a meio em prompts maiores
-                "num_predict": 800,  # suficiente para o schema, evita gerações descontroladas
+                "num_predict": 1400,  # suficiente para o schema, evita gerações descontroladas
             },
         },
         timeout=240,
@@ -297,8 +296,8 @@ def notificar_ntfy(titulo: str, mensagem: str, fontes: list) -> None:
 def nota_data_passada(estado_anterior: dict) -> str:
     """Rede de segurança: se a data prevista já passou há vários dias sem
     confirmação, avisa o Gemma para verificar se o evento já ocorreu."""
-    data_str = estado_anterior.get("data_lancamento") if estado_anterior else None
-    if not data_str or estado_anterior.get("estado_lancamento") == "lancado":
+    data_str = estado_anterior.get("launch_date") if estado_anterior else None
+    if not data_str or estado_anterior.get("launch_status") == "launched":
         return ""
 
     try:
@@ -308,9 +307,9 @@ def nota_data_passada(estado_anterior: dict) -> str:
 
     if date.today() - data_prevista > timedelta(days=DIAS_TOLERANCIA_DATA):
         return (
-            f"\n\nNota: a data anteriormente prevista ({data_str}) já passou há mais de "
-            f"{DIAS_TOLERANCIA_DATA} dias sem confirmação clara. Verifica nos resultados "
-            "se entretanto já ocorreu, e se sim, atualiza para o evento seguinte."
+            f"\n\nNote: the previously recorded launch date ({data_str}) passed more than "
+            f"{DIAS_TOLERANCIA_DATA} days ago without clear confirmation. Check the results "
+            "to see if the launch occurred, and if so, update to the next flight."
         )
     return ""
 
@@ -334,7 +333,7 @@ def processar_job(job: dict) -> Optional[dict]:
 
     resultados_resumidos = resumir_resultados_tavily(resultado_tavily)
     fontes_tavily = [
-        r["url"] for r in resultados_resumidos.get("resultados", [])
+        r["url"] for r in resultados_resumidos.get("results", [])
         if r.get("url") and e_url_util(r["url"])
     ]
     log_debug(f"[{job_id}] a validar {len(fontes_tavily)} URLs da Tavily...")
@@ -362,21 +361,21 @@ def processar_job(job: dict) -> Optional[dict]:
     log_debug(f"[{job_id}] Gemma respondeu em {time.time() - t0:.1f}s")
     log_debug(f"[{job_id}] Gemma resposta:\n{json.dumps(resposta, indent=2, ensure_ascii=False)}")
 
-    campos_esperados = {"ha_novidade", "titulo", "novidades", "resumo_completo", "fontes"}
+    campos_esperados = {"has_news", "title", "delta", "summary", "launch_status", "launch_date"}
     if not campos_esperados.issubset(resposta.keys()):
         log(f"ERRO [{job_id}] resposta do Gemma sem os campos esperados: {resposta}")
         return None
 
     modo = job.get("modo", "novidade")
-    deve_notificar = modo == "diario" or resposta.get("ha_novidade") is True
-    log_debug(f"[{job_id}] modo={modo} ha_novidade={resposta.get('ha_novidade')} "
+    deve_notificar = modo == "diario" or resposta.get("has_news") is True
+    log_debug(f"[{job_id}] modo={modo} has_news={resposta.get('has_news')} "
               f"-> {'vai notificar' if deve_notificar else 'não notifica'}")
 
     if deve_notificar:
-        usar_delta = modo == "novidade" and resposta.get("novidades")
-        corpo = resposta["novidades"] if usar_delta else resposta["resumo_completo"]
+        usar_delta = modo == "novidade" and resposta.get("delta")
+        corpo = resposta["delta"] if usar_delta else resposta["summary"]
         try:
-            notificar_ntfy(resposta["titulo"], corpo, fontes_tavily)
+            notificar_ntfy(resposta["title"], corpo, fontes_tavily)
             log_debug(f"[{job_id}] notificação enviada.")
         except Exception as erro:
             log(f"ERRO [{job_id}] ntfy: {erro}")
