@@ -182,44 +182,26 @@ def pesquisar_tavily(query: str, time_range: str = "month") -> dict:
     return resp.json()
 
 
-def resumir_resultados_tavily(resultado_tavily: dict, max_caracteres_por_resultado: int = 500) -> dict:
-    """Reduz a resposta crua da Tavily ao essencial antes de ir para o
-    prompt do Gemma — menos ruído, menos tokens, menos risco de estourar
-    o contexto e cortar o JSON de resposta a meio.
-    Nota: não incluímos o campo 'answer' (resumo da Tavily) de propósito —
-    o Gemma tendia a copiá-lo em vez de analisar os resultados individuais."""
-    resultados_reduzidos = []
-    for r in resultado_tavily.get("results", [])[:5]:
-        resultados_reduzidos.append({
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "published_date": r.get("published_date", ""),
-            "content": (r.get("content", "") or "")[:max_caracteres_por_resultado],
-        })
-    return {"results": resultados_reduzidos}
+def extrair_urls_tavily(resultado_tavily: dict) -> list:
+    """Extrai e valida os URLs dos resultados da Tavily para usar na
+    notificação. O conteúdo dos resultados já não vai para o Gemma."""
+    urls = [
+        r.get("url", "") for r in resultado_tavily.get("results", [])
+        if r.get("url") and e_url_util(r.get("url", ""))
+    ]
+    return [u for u in urls if url_existe(u)]
 
 
-# Schema real (não só "é JSON válido") — restringe a geração aos nomes e
-# tipos de campo exatos. Keys em inglês para consistência com o conteúdo
-# da Tavily (também em inglês) e evitar confusão de línguas no modelo.
+# Schema reduzido — Gemma só gera título e metadados de lançamento.
+# Deteção de novidade é feita em Python, corpo da notificação vem da Tavily.
 SCHEMA_RESPOSTA_GEMMA = {
     "type": "object",
     "properties": {
-        "has_news": {"type": "boolean"},
         "title": {"type": "string"},
-        "delta": {"type": "string"},
-        "summary": {"type": "string"},
         "launch_status": {"type": "string"},
         "launch_date": {"type": ["string", "null"]},
     },
-    "required": [
-        "has_news",
-        "title",
-        "delta",
-        "summary",
-        "launch_status",
-        "launch_date",
-    ],
+    "required": ["title", "launch_status", "launch_date"],
 }
 
 
@@ -236,7 +218,7 @@ def perguntar_gemma(prompt: str) -> dict:
             "options": {
                 "temperature": 0.2,
                 "num_ctx": 8192,     # o defeito do Ollama (2048-4096) corta o JSON a meio em prompts maiores
-                "num_predict": 1400,  # suficiente para o schema, evita gerações descontroladas
+                "num_predict": 800,  # suficiente para o schema, evita gerações descontroladas
             },
         },
         timeout=240,
@@ -319,6 +301,7 @@ def processar_job(job: dict) -> Optional[dict]:
     job_id = job["id"]
     estado_anterior = ESTADO_CONTEUDO_ATUAL.get(job_id, {})
 
+    # 1. Pesquisa Tavily
     log_debug(f"[{job_id}] a chamar Tavily...")
     t0 = time.time()
     try:
@@ -328,27 +311,43 @@ def processar_job(job: dict) -> Optional[dict]:
     except Exception as erro:
         log(f"ERRO [{job_id}] Tavily: {erro}")
         return None
-    log_debug(f"[{job_id}] Tavily respondeu em {time.time() - t0:.1f}s "
-              f"({len(resultado_tavily.get('results', []))} resultados)")
+    log_debug(f"[{job_id}] Tavily respondeu em {time.time() - t0:.1f}s")
 
-    resultados_resumidos = resumir_resultados_tavily(resultado_tavily)
-    fontes_tavily = [
-        r["url"] for r in resultados_resumidos.get("results", [])
-        if r.get("url") and e_url_util(r["url"])
-    ]
-    log_debug(f"[{job_id}] a validar {len(fontes_tavily)} URLs da Tavily...")
-    fontes_tavily = [url for url in fontes_tavily if url_existe(url)]
-    log_debug(f"[{job_id}] {len(fontes_tavily)} URLs válidos após validação")
-    log_debug(f"[{job_id}] Tavily resumo:\n{json.dumps(resultados_resumidos, indent=2, ensure_ascii=False)}")
+    answer = (resultado_tavily.get("answer") or "").strip()
+    if not answer:
+        log(f"ERRO [{job_id}] Tavily não devolveu resumo (campo 'answer' vazio).")
+        return None
+    log_debug(f"[{job_id}] Tavily answer: {answer}")
 
+    # 2. Deteção de novidade em Python — sem depender do Gemma para isto
+    answer_anterior = (estado_anterior.get("answer") or "").strip()
+    modo = job.get("modo", "novidade")
+    has_news = answer != answer_anterior
+    deve_notificar = modo == "diario" or has_news
+
+    # Estado base: atualiza sempre o answer (mesmo sem notificar),
+    # para a próxima comparação ser contra a versão mais recente
+    novo_estado = {
+        "answer": answer,
+        "launch_status": estado_anterior.get("launch_status", "unknown"),
+        "launch_date": estado_anterior.get("launch_date"),
+    }
+
+    if not deve_notificar:
+        log(f"[{job_id}] sem novidade, não notificou.")
+        return novo_estado
+
+    # 3. Extrai e valida URLs (não passam pelo Gemma)
+    log_debug(f"[{job_id}] a validar URLs da Tavily...")
+    fontes_tavily = extrair_urls_tavily(resultado_tavily)
+    log_debug(f"[{job_id}] {len(fontes_tavily)} URLs válidos")
+
+    # 4. Gemma: só gera título e extrai metadados de data/estado
     prompt_final = job["promptZAI"]
-    prompt_final = prompt_final.replace(
-        "{{ESTADO_ANTERIOR}}", json.dumps(estado_anterior, ensure_ascii=False)
-    )
-    prompt_final = prompt_final.replace(
-        "{{RESULTADOS_TAVILY}}", json.dumps(resultados_resumidos, ensure_ascii=False)
-    )
+    prompt_final = prompt_final.replace("{{TAVILY_ANSWER}}", answer)
     prompt_final = prompt_final.replace("{{DATA_HOJE}}", date.today().isoformat())
+    prompt_final = prompt_final.replace("{{LAUNCH_STATUS}}", estado_anterior.get("launch_status") or "unknown")
+    prompt_final = prompt_final.replace("{{LAUNCH_DATE}}", estado_anterior.get("launch_date") or "unknown")
     prompt_final += nota_data_passada(estado_anterior)
 
     log_debug(f"[{job_id}] a chamar Gemma...")
@@ -357,32 +356,29 @@ def processar_job(job: dict) -> Optional[dict]:
         resposta = perguntar_gemma(prompt_final)
     except Exception as erro:
         log(f"ERRO [{job_id}] Gemma: {erro}")
-        return None
+        # Gemma falhou mas já temos o answer — notifica sem título elaborado
+        notificar_ntfy("Starship update", answer, fontes_tavily)
+        return novo_estado
     log_debug(f"[{job_id}] Gemma respondeu em {time.time() - t0:.1f}s")
     log_debug(f"[{job_id}] Gemma resposta:\n{json.dumps(resposta, indent=2, ensure_ascii=False)}")
 
-    campos_esperados = {"has_news", "title", "delta", "summary", "launch_status", "launch_date"}
-    if not campos_esperados.issubset(resposta.keys()):
-        log(f"ERRO [{job_id}] resposta do Gemma sem os campos esperados: {resposta}")
-        return None
+    if "title" not in resposta:
+        log(f"ERRO [{job_id}] Gemma não devolveu 'title': {resposta}")
+        notificar_ntfy("Starship update", answer, fontes_tavily)
+        return novo_estado
 
-    modo = job.get("modo", "novidade")
-    deve_notificar = modo == "diario" or resposta.get("has_news") is True
-    log_debug(f"[{job_id}] modo={modo} has_news={resposta.get('has_news')} "
-              f"-> {'vai notificar' if deve_notificar else 'não notifica'}")
+    # Atualiza metadados com o que o Gemma extraiu
+    novo_estado["launch_status"] = resposta.get("launch_status", "unknown")
+    novo_estado["launch_date"] = resposta.get("launch_date")
 
-    if deve_notificar:
-        usar_delta = modo == "novidade" and resposta.get("delta")
-        corpo = resposta["delta"] if usar_delta else resposta["summary"]
-        try:
-            notificar_ntfy(resposta["title"], corpo, fontes_tavily)
-            log_debug(f"[{job_id}] notificação enviada.")
-        except Exception as erro:
-            log(f"ERRO [{job_id}] ntfy: {erro}")
-    else:
-        log(f"[{job_id}] sem novidade, não notificou.")
+    # 5. Notifica: título do Gemma, corpo = answer da Tavily
+    try:
+        notificar_ntfy(resposta["title"], answer, fontes_tavily)
+        log_debug(f"[{job_id}] notificação enviada.")
+    except Exception as erro:
+        log(f"ERRO [{job_id}] ntfy: {erro}")
 
-    return resposta
+    return novo_estado
 
 
 # ---------- main ----------
